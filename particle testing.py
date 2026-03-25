@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import json
 import argparse
+import re
 
 
 class ParticleAnalyzer:
@@ -41,7 +42,7 @@ class ParticleAnalyzer:
         
         # ── LOAD REFERENCE IMAGES ───────────────────────────────
         if background_path and Path(background_path).exists():
-            self.background = cv2.imread(background_path)
+            self.background = self._fix_orientation(cv2.imread(background_path))
             print(f"Loaded background: {background_path}")
         
         if background_video_path and Path(background_video_path).exists():
@@ -49,11 +50,11 @@ class ParticleAnalyzer:
             ret, frame = cap.read()
             cap.release()
             if ret:
-                self.background_video = frame
-                print(f"Loaded video background: {background_video_path} ({frame.shape[1]}x{frame.shape[0]})")
+                self.background_video = self._fix_orientation(frame)
+                print(f"Loaded video background: {background_video_path} ({self.background_video.shape[1]}x{self.background_video.shape[0]})")
         
         if suspended_path and Path(suspended_path).exists():
-            suspended = cv2.imread(suspended_path)
+            suspended = self._fix_orientation(cv2.imread(suspended_path))
             print(f"Loaded suspended reference: {suspended_path}")
             self._suspended_frame = suspended
         else:
@@ -70,6 +71,14 @@ class ParticleAnalyzer:
         self._last_density = None
         self._last_blob_mask = None
     
+    # ── ORIENTATION FIX ─────────────────────────────────────────
+    def _fix_orientation(self, frame):
+        """Rotate portrait frames to landscape (counter-clockwise)."""
+        h, w = frame.shape[:2]
+        if h > w:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
+
     # ── CIRCULAR VESSEL MASK ────────────────────────────────────
     def _init_mask(self, h, w):
         self.center = (w // 2, h // 2)
@@ -428,7 +437,8 @@ class ParticleAnalyzer:
         if not ret:
             cap.release()
             return None
-        
+        frame = self._fix_orientation(frame)
+
         h, w = frame.shape[:2]
         if self._needs_mask_reinit(h, w):
             self._init_mask(h, w)
@@ -441,6 +451,7 @@ class ParticleAnalyzer:
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ret, frame = cap.read()
             if ret:
+                frame = self._fix_orientation(frame)
                 end_coverages.append(self.calc_spread(frame, normalize=False, video_mode=True)['coverage'])
                 last_frame = frame
         
@@ -471,15 +482,17 @@ class ParticleAnalyzer:
         cap = cv2.VideoCapture(str(video_path))
         ret, first_frame = cap.read()
         cap.release()
-        
+
         if not ret:
             return None
-        
+        first_frame = self._fix_orientation(first_frame)
+
         vid_h, vid_w = first_frame.shape[:2]
-        
+
         photo = cv2.imread(str(photo_path))
         if photo is None:
             return None
+        photo = self._fix_orientation(photo)
         
         # Resize photo to video res + compress to match video quality
         photo_resized = cv2.resize(photo, (vid_w, vid_h))
@@ -705,9 +718,23 @@ def main():
     
     # Store normal background so we can swap back from CPM
     analyzer._bg_video_normal = analyzer.background_video
-    
+
+    # ── VOLUME-SPECIFIC BLANK REFERENCES ──────────────────────
+    volume_backgrounds = {}  # {volume_str: frame}
+    for ref_path in list(input_dir.glob('*Blank Reference*')) + list(input_dir.glob('*blank reference*')):
+        m = re.search(r'(\d+)\s*m[lL]', ref_path.stem)
+        if m:
+            vol = m.group(1)  # e.g. "200"
+            cap = cv2.VideoCapture(str(ref_path))
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                frame = analyzer._fix_orientation(frame)
+                volume_backgrounds[vol] = frame
+                print(f"Loaded volume background: {ref_path.name} → {vol}mL ({frame.shape[1]}x{frame.shape[0]})")
+
     # ── FIND EXPERIMENT FILES ───────────────────────────────────
-    exclude = ['background', 'suspended', 'empty', 'base_before']  # ◄ Filenames to skip
+    exclude = ['background', 'suspended', 'empty', 'base_before', 'blank', 'reference']  # ◄ Filenames to skip
     images = []
     for ext in ['*.JPG', '*.jpg', '*.png', '*.PNG']:
         images += [p for p in input_dir.glob(ext) if not any(e in p.stem.lower() for e in exclude)]
@@ -754,13 +781,20 @@ def main():
                 print(f"  CPM mode enabled (CPM background + purple HSV range)")
             else:
                 analyzer.background_video = analyzer._bg_video_normal  # ◄ Swap back to normal
-        
+
+        # ── VOLUME-BASED BACKGROUND SWAP ─────────────────────
+        if volume_backgrounds and not is_cpm:
+            vol_match = re.search(r'(\d+)\s*m[lL]', name)
+            if vol_match and vol_match.group(1) in volume_backgrounds:
+                analyzer.background_video = volume_backgrounds[vol_match.group(1)]
+
         # ── ANALYZE END PHOTO ──────────────────────────────────
         frame = cv2.imread(str(img_path))
         if frame is None:
             print(f"  Could not read image")
             continue
-        
+        frame = analyzer._fix_orientation(frame)
+
         img_spread = analyzer.calc_spread(frame)
         
         result = {
@@ -782,7 +816,9 @@ def main():
                 cap = cv2.VideoCapture(str(videos[name]))
                 ret, first_frame = cap.read()
                 cap.release()
-                if not ret:
+                if ret:
+                    first_frame = analyzer._fix_orientation(first_frame)
+                else:
                     first_frame = None
                 
                 # ── SAVE VIDEO FRAME OVERLAYS ──────────────────
