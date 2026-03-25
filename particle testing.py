@@ -493,7 +493,7 @@ class ParticleAnalyzer:
         if photo is None:
             return None
         photo = self._fix_orientation(photo)
-        
+
         # Resize photo to video res + compress to match video quality
         photo_resized = cv2.resize(photo, (vid_w, vid_h))
         _, encoded = cv2.imencode('.jpg', photo_resized, [cv2.IMWRITE_JPEG_QUALITY, 50])  # ◄ JPEG quality
