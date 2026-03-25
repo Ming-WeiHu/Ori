@@ -641,8 +641,8 @@ def main():
     # ==================== SETTINGS ====================
     SAVE_IMAGES = False  # Save photo overlays + comparison chart
     SAVE_VIDEO = True    # Save video frame detection overlays
-    TEST_SINGLE = False  # Only process one image (for debugging)
-    TEST_NAME = "C3_25cpm_0up_0down_8BH_20SL_after_post_breathe_mix"  # Filename stem (empty = first)
+    TEST_SINGLE = True  # Only process one image (for debugging)
+    TEST_NAME = "200mL_20deg_25rpm"  # Filename stem (empty = first)
     TEST_CPM = False  # Only process CPM files
     # ==================================================
     
