@@ -1,0 +1,56 @@
+[
+  {
+    "name": "100mL_15deg_10rpm",
+    "end_spread": 855922.0,
+    "blue_pixels": 717150,
+    "video_end_pct": 0.09717552326567816,
+    "photo_end_pct": 0.051998917886530084,
+    "status": "CONCENTRATING"
+  },
+  {
+    "name": "100mL_15deg_12rpm",
+    "end_spread": 1105406.0,
+    "blue_pixels": 942079,
+    "video_end_pct": 0.12808951008305292,
+    "photo_end_pct": 0.06715555368979613,
+    "status": "CONCENTRATING"
+  },
+  {
+    "name": "100mL_15deg_15rpm",
+    "end_spread": 1422586.0,
+    "blue_pixels": 1064993,
+    "video_end_pct": 0.2093731462320289,
+    "photo_end_pct": 0.08642485249885772,
+    "status": "CONCENTRATING"
+  },
+  {
+    "name": "100mL_15deg_16rpm",
+    "end_spread": 1406552.0,
+    "blue_pixels": 758378,
+    "video_end_pct": 0.28164393536905696,
+    "photo_end_pct": 0.08545075596974334,
+    "status": "CONCENTRATING"
+  },
+  {
+    "name": "100mL_15deg_17cpm",
+    "end_spread": 719289.0,
+    "blue_pixels": 191527,
+    "photo_end_pct": 0.061373703222847034
+  },
+  {
+    "name": "100mL_15deg_5rpm",
+    "end_spread": 812167.0,
+    "blue_pixels": 654044,
+    "video_end_pct": 0.08196848537687967,
+    "photo_end_pct": 0.04934071696153327,
+    "status": "CONCENTRATING"
+  },
+  {
+    "name": "100mL_15deg_7rpm",
+    "end_spread": 730174.0,
+    "blue_pixels": 558958,
+    "video_end_pct": 0.07489459968106418,
+    "photo_end_pct": 0.04435948353807849,
+    "status": "CONCENTRATING"
+  }
+]
