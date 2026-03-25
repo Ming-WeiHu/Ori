@@ -100,12 +100,6 @@ class ParticleAnalyzer:
             self.mask = cv2.bitwise_and(self.mask, cv2.bitwise_not(obstruction))
             print(f"  CPM mask applied: hub={hub_radius}px, bar=20deg, {np.sum(obstruction > 0):,}px excluded")
         
-        # Calculate suspended coverage as 100% reference
-        if self._suspended_frame is not None and self.suspended_spread is None:
-            result = self.calc_spread(self._suspended_frame, normalize=False)
-            self.suspended_spread = result['coverage']
-            print(f"Suspended reference: {self.suspended_spread:,} pixels coverage (= 100%)")
-    
     def _needs_mask_reinit(self, h, w):
         """Check if mask needs to be recalculated."""
         if self.mask is None or self.mask_shape != (h, w):
@@ -257,9 +251,10 @@ class ParticleAnalyzer:
         
         coverage = np.sum(dilated > 0)
         
-        # Normalize relative to suspended reference
-        if normalize and self.suspended_spread and self.suspended_spread > 0:
-            spread = coverage / self.suspended_spread
+        # Normalize relative to mask area (same basis as video)
+        if normalize:
+            mask_area = float(np.sum(self.mask > 0))
+            spread = coverage / mask_area if mask_area > 0 else 0.0
         else:
             spread = coverage
         
@@ -640,8 +635,8 @@ def main():
     # ==================== SETTINGS ====================
     SAVE_IMAGES = False  # Save photo overlays + comparison chart
     SAVE_VIDEO = True    # Save video frame detection overlays
-    TEST_SINGLE = False  # Only process one image (for debugging)
-    TEST_NAME = "C3_25cpm_0up_0down_8BH_20SL_after_post_breathe_mix"  # Filename stem (empty = first)
+    TEST_SINGLE = True  # Only process one image (for debugging)
+    TEST_NAME = "200mL_20deg_25rpm"  # Filename stem (empty = first)
     TEST_CPM = False  # Only process CPM files
     # ==================================================
     
