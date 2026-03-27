@@ -70,6 +70,13 @@ class ParticleAnalyzer:
         self._last_dilated = None
         self._last_density = None
         self._last_blob_mask = None
+        self._detected_circle = None   # cached: (cx_ratio, cy_ratio, radius, orig_w, orig_h)
+
+        # Early circle detection on background (cleanest view of vessel edge)
+        early_frame = self.background if self.background is not None else self.background_video
+        if early_frame is not None:
+            eh, ew = early_frame.shape[:2]
+            self._init_mask(eh, ew, frame=early_frame)
     
     # ── ORIENTATION FIX ─────────────────────────────────────────
     def _fix_orientation(self, frame):
@@ -79,10 +86,84 @@ class ParticleAnalyzer:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
         return frame
 
+    # ── AUTO-DETECT BIOREACTOR CIRCLE ─────────────────────────
+    def _detect_circle(self, frame):
+        """Auto-detect the bioreactor circle from a frame.
+        Returns (center_x, center_y, radius) or None if detection fails."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+        h, w = gray.shape[:2]
+        min_dim = min(w, h)
+
+        # Edge detection
+        edges = cv2.Canny(blurred, 30, 100)
+
+        # Dilate to close small gaps in the vessel edge
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+        # Find all contours
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        best = None
+        best_score = -1
+
+        for cnt in contours:
+            # Fit minimum enclosing circle
+            (cx, cy), r = cv2.minEnclosingCircle(cnt)
+            cx, cy, r = int(cx), int(cy), int(r)
+
+            # Filter: radius must be 20-55% of frame min dimension
+            if r < min_dim * 0.20 or r > min_dim * 0.55:
+                continue
+
+            # Filter: circle must be mostly within frame
+            if cx - r < -r * 0.15 or cy - r < -r * 0.15:
+                continue
+            if cx + r > w + r * 0.15 or cy + r > h + r * 0.15:
+                continue
+
+            # Score: prefer large, circular contours
+            area = cv2.contourArea(cnt)
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
+                continue
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+
+            # Score combines size (want largest) and circularity (want roundest)
+            score = r * circularity
+            if score > best_score:
+                best_score = score
+                best = (cx, cy, r)
+
+        return best
+
     # ── CIRCULAR VESSEL MASK ────────────────────────────────────
-    def _init_mask(self, h, w):
-        self.center = (w // 2, h // 2)
-        self.radius = int(min(w, h) * 0.47)  # ◄ Mask radius as fraction of frame
+    def _init_mask(self, h, w, frame=None):
+        # Try auto-detection if a frame is provided and no cached detection
+        if frame is not None and self._detected_circle is None:
+            detected = self._detect_circle(frame)
+            if detected:
+                # Cache as normalized ratios so we can scale to any resolution
+                self._detected_circle = (
+                    detected[0] / w,    # cx ratio
+                    detected[1] / h,    # cy ratio
+                    detected[2],        # radius in pixels
+                    w, h                # original detection resolution
+                )
+
+        if self._detected_circle:
+            cx_r, cy_r, orig_rad, orig_w, orig_h = self._detected_circle
+            self.center = (int(cx_r * w), int(cy_r * h))
+            self.radius = int(orig_rad * min(w, h) / min(orig_w, orig_h))
+            print(f"  Auto-detected vessel: center=({self.center[0]},{self.center[1]}), radius={self.radius}")
+        else:
+            # Fallback to preset
+            self.center = (w // 2, h // 2)
+            self.radius = int(min(w, h) * 0.47)
+            print(f"  Using preset vessel: center=({self.center[0]},{self.center[1]}), radius={self.radius}")
+
         self.mask = np.zeros((h, w), dtype=np.uint8)
         cv2.circle(self.mask, self.center, self.radius, 255, -1)
         self.mask_shape = (h, w)
@@ -121,7 +202,7 @@ class ParticleAnalyzer:
     def detect_particles(self, frame, video_mode=False):
         h, w = frame.shape[:2]
         if self._needs_mask_reinit(h, w):
-            self._init_mask(h, w)
+            self._init_mask(h, w, frame=frame)
         
         # Step 1: Apply vessel mask
         masked = cv2.bitwise_and(frame, frame, mask=self.mask)
@@ -174,7 +255,7 @@ class ParticleAnalyzer:
         Outputs: {name}_1_masked, _2_hsv_blue, _3_bg_diff, _4_bg_thresh, _5_final"""
         h, w = frame.shape[:2]
         if self._needs_mask_reinit(h, w):
-            self._init_mask(h, w)
+            self._init_mask(h, w, frame=frame)
         
         # Pick HSV range based on mode
         if self.cpm_mode:
@@ -436,7 +517,7 @@ class ParticleAnalyzer:
 
         h, w = frame.shape[:2]
         if self._needs_mask_reinit(h, w):
-            self._init_mask(h, w)
+            self._init_mask(h, w, frame=frame)
         mask_area = float(np.sum(self.mask > 0))
         
         # Average last 3 frames for stability
@@ -525,7 +606,7 @@ class ParticleAnalyzer:
         Returns ratio: 1.0 = everything suspended, 0.0 = everything in blobs."""
         h, w = frame.shape[:2]
         if self._needs_mask_reinit(h, w):
-            self._init_mask(h, w)
+            self._init_mask(h, w, frame=frame)
         
         # Get background for subtraction
         bg = None
