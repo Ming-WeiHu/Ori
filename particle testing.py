@@ -30,10 +30,27 @@ class ParticleAnalyzer:
         self.cpm_lower_video = np.array([95, 40, 30])    # [Hue min, Sat min, Val min]
         self.cpm_upper_video = np.array([150, 255, 255])  # [Hue max, Sat max, Val max]
 
+        # ── MID-VOLUME HSV RANGES (100mL: slightly wider than normal) ──
+        # Photo
+        self.midvol_lower = np.array([93, 40, 40])             # [Hue min, Sat min, Val min]
+        self.midvol_upper = np.array([135, 255, 255])           # [Hue max, Sat max, Val max]
+        # Video
+        self.midvol_lower_video = np.array([90, 28, 28])       # [Hue min, Sat min, Val min]
+        self.midvol_upper_video = np.array([135, 255, 255])     # [Hue max, Sat max, Val max]
+
+        # ── HIGH-VOLUME HSV RANGES (200mL+: particles fainter through deeper water) ──
+        # Photo
+        self.highvol_lower = np.array([90, 30, 30])            # [Hue min, Sat min, Val min]
+        self.highvol_upper = np.array([140, 255, 255])          # [Hue max, Sat max, Val max]
+        # Video
+        self.highvol_lower_video = np.array([85, 20, 20])      # [Hue min, Sat min, Val min]
+        self.highvol_upper_video = np.array([140, 255, 255])    # [Hue max, Sat max, Val max]
+
         # ── BACKGROUND SUBTRACTION THRESHOLDS ───────────────────
         # Higher = stricter (less noise, might miss faint particles)
         # Lower = more sensitive (catches faint particles, more noise)
         self.bg_diff_thresh = 15       # Normal mode
+        self.highvol_bg_diff_thresh = 15  # High-volume mode (200mL+, blur handles noise)
         self.cpm_bg_diff_thresh = 30  # CPM mode (lower for fainter particles)
 
         self.background = None
@@ -42,7 +59,7 @@ class ParticleAnalyzer:
         
         # ── LOAD REFERENCE IMAGES ───────────────────────────────
         if background_path and Path(background_path).exists():
-            self.background = self._fix_orientation(cv2.imread(background_path))
+            self.background = cv2.imread(background_path)
             print(f"Loaded background: {background_path}")
         
         if background_video_path and Path(background_video_path).exists():
@@ -50,11 +67,11 @@ class ParticleAnalyzer:
             ret, frame = cap.read()
             cap.release()
             if ret:
-                self.background_video = self._fix_orientation(frame)
+                self.background_video = frame
                 print(f"Loaded video background: {background_video_path} ({self.background_video.shape[1]}x{self.background_video.shape[0]})")
         
         if suspended_path and Path(suspended_path).exists():
-            suspended = self._fix_orientation(cv2.imread(suspended_path))
+            suspended = cv2.imread(suspended_path)
             print(f"Loaded suspended reference: {suspended_path}")
             self._suspended_frame = suspended
         else:
@@ -66,26 +83,16 @@ class ParticleAnalyzer:
         self.radius = None
         self.mask_shape = None
         self.cpm_mode = False          # Toggled per-file based on filename
+        self.high_volume = False       # Toggled per-file for 200mL+ (wider HSV)
+        self.mid_volume = False        # Toggled per-file for 100mL (slightly wider HSV)
         self._last_cpm_mode = False
         self._last_dilated = None
         self._last_density = None
         self._last_blob_mask = None
-        self._detected_circle = None   # cached: (cx_ratio, cy_ratio, radius, orig_w, orig_h)
+        self._detected_circles = {}    # cached per orientation+volume: {'landscape_200': ..., 'portrait_100': ...}
 
-        # Early circle detection on background (cleanest view of vessel edge)
-        early_frame = self.background if self.background is not None else self.background_video
-        if early_frame is not None:
-            eh, ew = early_frame.shape[:2]
-            self._init_mask(eh, ew, frame=early_frame)
+        # Skip early mask init — manual circle draw will trigger on first experiment frame
     
-    # ── ORIENTATION FIX ─────────────────────────────────────────
-    def _fix_orientation(self, frame):
-        """Rotate portrait frames to landscape (counter-clockwise)."""
-        h, w = frame.shape[:2]
-        if h > w:
-            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        return frame
-
     # ── AUTO-DETECT BIOREACTOR CIRCLE ─────────────────────────
     def _detect_circle(self, frame):
         """Auto-detect the bioreactor circle from a frame.
@@ -139,27 +146,87 @@ class ParticleAnalyzer:
 
         return best
 
+    # ── MANUAL CIRCLE DRAWING (fallback when auto-detect fails) ──
+    def _manual_circle(self, frame):
+        """Let user draw a circle by clicking center then dragging to set radius.
+        Returns (center_x, center_y, radius) or None if cancelled."""
+        display = frame.copy()
+        h, w = frame.shape[:2]
+        # Scale down for display if too large
+        max_dim = 900
+        scale = min(max_dim / w, max_dim / h, 1.0)
+        if scale < 1.0:
+            display = cv2.resize(display, (int(w * scale), int(h * scale)))
+
+        state = {'center': None, 'radius': 0, 'dragging': False, 'done': False}
+
+        def mouse_cb(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                state['center'] = (x, y)
+                state['dragging'] = True
+                state['radius'] = 0
+            elif event == cv2.EVENT_MOUSEMOVE and state['dragging']:
+                cx, cy = state['center']
+                state['radius'] = int(((x - cx)**2 + (y - cy)**2)**0.5)
+            elif event == cv2.EVENT_LBUTTONUP and state['dragging']:
+                state['dragging'] = False
+                state['done'] = True
+
+        win = 'Draw vessel circle (drag from center outward, ESC to cancel)'
+        cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback(win, mouse_cb)
+
+        print("  Draw the vessel circle: click center, drag to edge, release.")
+        print("  Press ESC to skip and use preset fallback.")
+
+        while True:
+            vis = display.copy()
+            if state['center'] and state['radius'] > 0:
+                cv2.circle(vis, state['center'], state['radius'], (0, 255, 0), 2)
+                cv2.circle(vis, state['center'], 3, (0, 0, 255), -1)
+            cv2.imshow(win, vis)
+
+            key = cv2.waitKey(30) & 0xFF
+            if key == 27:  # ESC
+                cv2.destroyWindow(win)
+                return None
+            if state['done']:
+                cv2.destroyWindow(win)
+                cx, cy = state['center']
+                r = state['radius']
+                # Scale back to original resolution
+                if scale < 1.0:
+                    cx = int(cx / scale)
+                    cy = int(cy / scale)
+                    r = int(r / scale)
+                return (cx, cy, r)
+
     # ── CIRCULAR VESSEL MASK ────────────────────────────────────
-    def _init_mask(self, h, w, frame=None):
-        # Try auto-detection if a frame is provided and no cached detection
-        if frame is not None and self._detected_circle is None:
-            detected = self._detect_circle(frame)
+    def _init_mask(self, h, w, frame=None, allow_manual=False):
+        orientation = 'landscape' if w >= h else 'portrait'
+        vol = getattr(self, '_current_volume', 'unknown')
+        mode = 'cpm' if self.cpm_mode else vol
+        cache_key = f"{orientation}_{mode}"
+
+        # Manual circle drawing only for video frames, per orientation+volume (skip for CPM — uses preset)
+        if not self.cpm_mode and frame is not None and cache_key not in self._detected_circles and allow_manual:
+            detected = self._manual_circle(frame)
             if detected:
-                # Cache as normalized ratios so we can scale to any resolution
-                self._detected_circle = (
+                print(f"  Manual circle ({cache_key}): center=({detected[0]},{detected[1]}), radius={detected[2]}")
+                self._detected_circles[cache_key] = (
                     detected[0] / w,    # cx ratio
                     detected[1] / h,    # cy ratio
                     detected[2],        # radius in pixels
                     w, h                # original detection resolution
                 )
 
-        if self._detected_circle:
-            cx_r, cy_r, orig_rad, orig_w, orig_h = self._detected_circle
+        if cache_key in self._detected_circles:
+            cx_r, cy_r, orig_rad, orig_w, orig_h = self._detected_circles[cache_key]
             self.center = (int(cx_r * w), int(cy_r * h))
             self.radius = int(orig_rad * min(w, h) / min(orig_w, orig_h))
-            print(f"  Auto-detected vessel: center=({self.center[0]},{self.center[1]}), radius={self.radius}")
+            print(f"  Using drawn vessel ({cache_key}): center=({self.center[0]},{self.center[1]}), radius={self.radius}")
         else:
-            # Fallback to preset
+            # Fallback preset (photos or user cancelled manual draw)
             self.center = (w // 2, h // 2)
             self.radius = int(min(w, h) * 0.47)
             print(f"  Using preset vessel: center=({self.center[0]},{self.center[1]}), radius={self.radius}")
@@ -212,11 +279,19 @@ class ParticleAnalyzer:
         if video_mode:
             if self.cpm_mode:
                 blue_mask = cv2.inRange(hsv, self.cpm_lower_video, self.cpm_upper_video)
+            elif self.high_volume:
+                blue_mask = cv2.inRange(hsv, self.highvol_lower_video, self.highvol_upper_video)
+            elif self.mid_volume:
+                blue_mask = cv2.inRange(hsv, self.midvol_lower_video, self.midvol_upper_video)
             else:
                 blue_mask = cv2.inRange(hsv, self.blue_lower_video, self.blue_upper_video)
         else:
             if self.cpm_mode:
                 blue_mask = cv2.inRange(hsv, self.cpm_lower, self.cpm_upper)
+            elif self.high_volume:
+                blue_mask = cv2.inRange(hsv, self.highvol_lower, self.highvol_upper)
+            elif self.mid_volume:
+                blue_mask = cv2.inRange(hsv, self.midvol_lower, self.midvol_upper)
             else:
                 blue_mask = cv2.inRange(hsv, self.blue_lower, self.blue_upper)
         
@@ -234,11 +309,19 @@ class ParticleAnalyzer:
                 bg_masked = cv2.bitwise_and(bg, bg, mask=self.mask)
                 diff = cv2.absdiff(masked, bg_masked)
                 diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-                # ◄ Background diff threshold (picks CPM or normal)
-                thresh = self.cpm_bg_diff_thresh if self.cpm_mode else self.bg_diff_thresh
+                # Blur to suppress small noise dots while keeping particle regions
+                if self.high_volume:
+                    diff_gray = cv2.GaussianBlur(diff_gray, (5, 5), 0)
+                # ◄ Background diff threshold (picks CPM, high-volume, or normal)
+                if self.cpm_mode:
+                    thresh = self.cpm_bg_diff_thresh
+                elif self.high_volume:
+                    thresh = self.highvol_bg_diff_thresh
+                else:
+                    thresh = self.bg_diff_thresh
                 _, diff_thresh = cv2.threshold(diff_gray, thresh, 255, cv2.THRESH_BINARY)
                 blue_mask = cv2.bitwise_and(blue_mask, diff_thresh)
-        
+
         # Step 4: Re-mask to vessel boundary
         blue_mask = cv2.bitwise_and(blue_mask, self.mask)
         
@@ -261,6 +344,12 @@ class ParticleAnalyzer:
         if self.cpm_mode:
             lower = self.cpm_lower_video if video_mode else self.cpm_lower
             upper = self.cpm_upper_video if video_mode else self.cpm_upper
+        elif self.high_volume:
+            lower = self.highvol_lower_video if video_mode else self.highvol_lower
+            upper = self.highvol_upper_video if video_mode else self.highvol_upper
+        elif self.mid_volume:
+            lower = self.midvol_lower_video if video_mode else self.midvol_lower
+            upper = self.midvol_upper_video if video_mode else self.midvol_upper
         else:
             lower = self.blue_lower_video if video_mode else self.blue_lower
             upper = self.blue_upper_video if video_mode else self.blue_upper
@@ -299,7 +388,12 @@ class ParticleAnalyzer:
             cv2.imwrite(str(output_dir / f"{name}_3_bg_diff.png"), diff_vis)
             
             # Debug step 4: Thresholded difference
-            thresh = self.cpm_bg_diff_thresh if self.cpm_mode else self.bg_diff_thresh
+            if self.cpm_mode:
+                thresh = self.cpm_bg_diff_thresh
+            elif self.high_volume:
+                thresh = self.highvol_bg_diff_thresh
+            else:
+                thresh = self.bg_diff_thresh
             _, diff_thresh = cv2.threshold(diff_gray, thresh, 255, cv2.THRESH_BINARY)
             diff_thresh_vis = frame.copy()
             diff_thresh_vis[diff_thresh > 0] = [0, 0, 255]  # Red overlay on passing pixels
@@ -388,7 +482,7 @@ class ParticleAnalyzer:
             sat_norm = np.zeros_like(blue_mask)
         
         # Threshold to keep only intense concentrated cores
-        _, conc_mask = cv2.threshold(sat_norm, 130, 255, cv2.THRESH_BINARY)  # ◄ Blob saturation threshold
+        _, conc_mask = cv2.threshold(sat_norm, 120, 255, cv2.THRESH_BINARY)  # ◄ Blob saturation threshold
         
         # Count pixels in concentrated vs suspended regions
         total_blue = int(np.sum(blue_mask > 0))
@@ -513,11 +607,10 @@ class ParticleAnalyzer:
         if not ret:
             cap.release()
             return None
-        frame = self._fix_orientation(frame)
 
         h, w = frame.shape[:2]
         if self._needs_mask_reinit(h, w):
-            self._init_mask(h, w, frame=frame)
+            self._init_mask(h, w, frame=frame, allow_manual=True)
         mask_area = float(np.sum(self.mask > 0))
         
         # Average last 3 frames for stability
@@ -527,7 +620,6 @@ class ParticleAnalyzer:
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ret, frame = cap.read()
             if ret:
-                frame = self._fix_orientation(frame)
                 end_coverages.append(self.calc_spread(frame, normalize=False, video_mode=True)['coverage'])
                 last_frame = frame
         
@@ -561,14 +653,12 @@ class ParticleAnalyzer:
 
         if not ret:
             return None
-        first_frame = self._fix_orientation(first_frame)
 
         vid_h, vid_w = first_frame.shape[:2]
 
         photo = cv2.imread(str(photo_path))
         if photo is None:
             return None
-        photo = self._fix_orientation(photo)
         
         # Resize photo to video res + compress to match video quality
         photo_resized = cv2.resize(photo, (vid_w, vid_h))
@@ -688,8 +778,8 @@ class ParticleAnalyzer:
         
         # Blob contour overlay (red outlines + centroids)
         if draw_blobs:
-            blob_result = self.analyze_blobs(frame)
-            blue_mask_blobs = self.detect_particles(frame)
+            blob_result = self.analyze_blobs(frame, video_mode=video_mode)
+            blue_mask_blobs = self.detect_particles(frame, video_mode=video_mode)
             masked_blobs = cv2.bitwise_and(frame, frame, mask=self.mask)
             hsv_blobs = cv2.cvtColor(masked_blobs, cv2.COLOR_BGR2HSV)
             sat = hsv_blobs[:, :, 1]
@@ -699,7 +789,7 @@ class ParticleAnalyzer:
                 sat_norm = (sat_smooth / sat_smooth.max() * 255).astype(np.uint8)
             else:
                 sat_norm = np.zeros_like(blue_mask_blobs)
-            _, blob_dilated = cv2.threshold(sat_norm, 130, 255, cv2.THRESH_BINARY)  # ◄ Must match blob threshold
+            _, blob_dilated = cv2.threshold(sat_norm, 120, 255, cv2.THRESH_BINARY)  # ◄ Must match blob threshold
             contours, _ = cv2.findContours(blob_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             min_area = 0.005 * np.pi * self.radius ** 2  # ◄ Must match min_area_ratio
             
@@ -729,8 +819,8 @@ def main():
     # ==================== SETTINGS ====================
     SAVE_IMAGES = False  # Save photo overlays + comparison chart
     SAVE_VIDEO = True    # Save video frame detection overlays
-    TEST_SINGLE = True  # Only process one image (for debugging)
-    TEST_NAME = "200mL_20deg_25rpm"  # Filename stem (empty = first)
+    TEST_SINGLE = False  # Only process one image (for debugging)
+    TEST_NAME = ""  # Filename stem (empty = first)
     TEST_CPM = False  # Only process CPM files
     # ==================================================
     
@@ -761,7 +851,8 @@ def main():
     
     # Background video - normal (for video bg subtraction)
     bg_video_path = None
-    for name in ['Background video.MP4', 'Background video.mp4', 'Background_video.MP4', 'Background_video.mp4']:
+    for name in ['Background video.MP4', 'Background video.mp4', 'Background_video.MP4', 'Background_video.mp4',
+                  'Background video no water.MP4', 'Background video no water.mp4']:
         if (input_dir / name).exists():
             bg_video_path = str(input_dir / name)
             break
@@ -797,7 +888,8 @@ def main():
 
     # ── VOLUME-SPECIFIC BLANK REFERENCES ──────────────────────
     volume_backgrounds = {}  # {volume_str: frame}
-    for ref_path in list(input_dir.glob('*Blank Reference*')) + list(input_dir.glob('*blank reference*')):
+    ref_paths = set(input_dir.glob('*Blank Reference*')) | set(input_dir.glob('*blank reference*'))
+    for ref_path in ref_paths:
         m = re.search(r'(\d+)\s*m[lL]', ref_path.stem)
         if m:
             vol = m.group(1)  # e.g. "200"
@@ -805,12 +897,11 @@ def main():
             ret, frame = cap.read()
             cap.release()
             if ret:
-                frame = analyzer._fix_orientation(frame)
                 volume_backgrounds[vol] = frame
                 print(f"Loaded volume background: {ref_path.name} → {vol}mL ({frame.shape[1]}x{frame.shape[0]})")
 
     # ── FIND EXPERIMENT FILES ───────────────────────────────────
-    exclude = ['background', 'suspended', 'empty', 'base_before', 'blank', 'reference']  # ◄ Filenames to skip
+    exclude = ['background', 'suspended', 'empty', 'base_before', 'blank', 'reference', '_debug']  # ◄ Filenames to skip
     images = []
     for ext in ['*.JPG', '*.jpg', '*.png', '*.PNG']:
         images += [p for p in input_dir.glob(ext) if not any(e in p.stem.lower() for e in exclude)]
@@ -858,18 +949,28 @@ def main():
             else:
                 analyzer.background_video = analyzer._bg_video_normal  # ◄ Swap back to normal
 
-        # ── VOLUME-BASED BACKGROUND SWAP ─────────────────────
-        if volume_backgrounds and not is_cpm:
-            vol_match = re.search(r'(\d+)\s*m[lL]', name)
-            if vol_match and vol_match.group(1) in volume_backgrounds:
-                analyzer.background_video = volume_backgrounds[vol_match.group(1)]
+        # ── VOLUME-BASED BACKGROUND SWAP + HSV RANGE ────────
+        vol_match = re.search(r'(\d+)\s*m[lL]', name)
+        if vol_match:
+            vol_num = int(vol_match.group(1))
+            analyzer.high_volume = vol_num >= 200
+            analyzer.mid_volume = 100 <= vol_num < 200
+            new_vol = vol_match.group(1)
+            if getattr(analyzer, '_current_volume', None) != new_vol:
+                analyzer.mask = None  # Force mask reinit for new volume
+            analyzer._current_volume = new_vol
+            if volume_backgrounds and not is_cpm and new_vol in volume_backgrounds:
+                analyzer.background_video = volume_backgrounds[new_vol]
+        else:
+            analyzer.high_volume = False
+            analyzer.mid_volume = False
+            analyzer._current_volume = 'unknown'
 
         # ── ANALYZE END PHOTO ──────────────────────────────────
         frame = cv2.imread(str(img_path))
         if frame is None:
             print(f"  Could not read image")
             continue
-        frame = analyzer._fix_orientation(frame)
 
         img_spread = analyzer.calc_spread(frame)
         
@@ -892,19 +993,13 @@ def main():
                 cap = cv2.VideoCapture(str(videos[name]))
                 ret, first_frame = cap.read()
                 cap.release()
-                if ret:
-                    first_frame = analyzer._fix_orientation(first_frame)
-                else:
+                if not ret:
                     first_frame = None
                 
                 # ── SAVE VIDEO FRAME OVERLAYS ──────────────────
                 if SAVE_VIDEO:
-                    if last_video_frame is not None:
-                        analyzer.save_overlay(last_video_frame, output_dir / f"{name}_video_detection.png", draw_blobs=False, video_mode=True)
-                        print(f"  Saved video last frame overlay")
-                    if first_frame is not None:
-                        analyzer.save_overlay(first_frame, output_dir / f"{name}_first_frame.png", draw_blobs=False, video_mode=True)
-                        print(f"  Saved video first frame overlay")
+                    # Save video overlays later (after classification) so we know whether to draw blobs
+                    _save_video_frames = (first_frame, last_video_frame)
                     if TEST_SINGLE:  # Full debug steps for single test
                         if first_frame is not None:
                             analyzer.save_debug(first_frame, output_dir, f"{name}_vid_first", video_mode=True)
@@ -940,6 +1035,20 @@ def main():
                     result['status'] = 'INTERMEDIATE'
                 else:                     # ◄ CPM: > 13.5% = concentrating
                     result['status'] = 'CONCENTRATING'
+            elif analyzer.high_volume:
+                if end_pct < 0.35:       # ◄ 200mL+ CONCENTRATING cutoff
+                    result['status'] = 'CONCENTRATING'
+                elif end_pct < 0.55:     # ◄ 200mL+ INTERMEDIATE cutoff
+                    result['status'] = 'INTERMEDIATE'
+                else:                     # ◄ 200mL+ MOSTLY_SUSPENDED
+                    result['status'] = 'MOSTLY_SUSPENDED'
+            elif analyzer.mid_volume:
+                if end_pct < 0.35:       # ◄ 100mL CONCENTRATING cutoff
+                    result['status'] = 'CONCENTRATING'
+                elif end_pct < 0.46:     # ◄ 100mL INTERMEDIATE cutoff
+                    result['status'] = 'INTERMEDIATE'
+                else:                     # ◄ 100mL MOSTLY_SUSPENDED
+                    result['status'] = 'MOSTLY_SUSPENDED'
             else:
                 if end_pct < 0.40:       # ◄ CONCENTRATING cutoff
                     result['status'] = 'CONCENTRATING'
@@ -949,8 +1058,8 @@ def main():
                     result['status'] = 'MOSTLY_SUSPENDED'
             print(f"  Status: {result['status']}")
         
-        # ── BLOB ANALYSIS (on photo, for non-concentrating) ────
-        if result.get('status') in ('INTERMEDIATE', 'MOSTLY_SUSPENDED') or TEST_SINGLE:
+        # ── BLOB ANALYSIS (on photo, for non-concentrating; skip CPM) ────
+        if not analyzer.cpm_mode and (result.get('status') in ('INTERMEDIATE', 'MOSTLY_SUSPENDED') or TEST_SINGLE):
             blob_result = analyzer.analyze_blobs(frame)
             result['blob_analysis'] = {
                 'num_blobs': blob_result['num_blobs'],
@@ -998,10 +1107,23 @@ def main():
         # ── SAVE PHOTO OVERLAY ─────────────────────────────────
         if SAVE_IMAGES:
             is_not_concentrating = result.get('status') in ('INTERMEDIATE', 'MOSTLY_SUSPENDED')
-            analyzer.save_overlay(frame, output_dir / f"{name}_detection.png", draw_blobs=(is_not_concentrating or TEST_SINGLE))
+            analyzer.save_overlay(frame, output_dir / f"{name}_detection.png", draw_blobs=(not analyzer.cpm_mode and (is_not_concentrating or TEST_SINGLE)))
             if TEST_SINGLE:
                 analyzer.save_debug(frame, output_dir, f"{name}_photo")
-        
+
+        # ── SAVE VIDEO OVERLAYS (after classification) ─────
+        if SAVE_VIDEO and '_save_video_frames' in dir():
+            first_vf, last_vf = _save_video_frames
+            show_blobs = not analyzer.cpm_mode and (result.get('status') != 'MOSTLY_SUSPENDED' or TEST_SINGLE)
+            if last_vf is not None:
+                cv2.imwrite(str(output_dir / f"{name}_video_raw.png"), last_vf)
+                analyzer.save_overlay(last_vf, output_dir / f"{name}_video_detection.png", draw_blobs=show_blobs, video_mode=True)
+                print(f"  Saved video last frame (raw + overlay)")
+            if first_vf is not None:
+                analyzer.save_overlay(first_vf, output_dir / f"{name}_first_frame.png", draw_blobs=False, video_mode=True)
+                print(f"  Saved video first frame overlay")
+            del _save_video_frames
+
         results.append(result)
     
     if not results:
