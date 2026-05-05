@@ -53,6 +53,17 @@ class ParticleAnalyzer:
         self.highvol_bg_diff_thresh = 15  # High-volume mode (200mL+, blur handles noise)
         self.cpm_bg_diff_thresh = 30  # CPM mode (lower for fainter particles)
 
+        # ── MORPHOLOGICAL OPENING KERNEL (video_mode only) ──────
+        # Applied to the final mask AFTER HSV ∩ bg-diff. A 3x3 ellipse open kills
+        # any particle smaller than the kernel — fine for chunky clumps, lethal for
+        # the pixel-sized blue microcarriers in this dataset. Set to 0 to skip
+        # morphology entirely (preserves single-pixel particles); use the GUI tuner
+        # ("Morph" slider) to dial these in per tier.
+        self.morph_open_kernel_normal = 3
+        self.morph_open_kernel_mid    = 3
+        self.morph_open_kernel_high   = 3
+        self.morph_open_kernel_cpm    = 3
+
         self.background = None
         self.background_video = None
         self.suspended_spread = None
@@ -93,60 +104,39 @@ class ParticleAnalyzer:
 
         # Skip early mask init — manual circle draw will trigger on first experiment frame
     
-    # ── AUTO-DETECT BIOREACTOR CIRCLE ─────────────────────────
-    def _detect_circle(self, frame):
-        """Auto-detect the bioreactor circle from a frame.
-        Returns (center_x, center_y, radius) or None if detection fails."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-        h, w = gray.shape[:2]
-        min_dim = min(w, h)
+    # ── HSV RANGE HELPER ──────────────────────────────────────
+    def _get_hsv_range(self, video_mode=False):
+        """Return (lower, upper) HSV arrays based on current mode flags."""
+        if self.cpm_mode:
+            if video_mode:
+                return self.cpm_lower_video, self.cpm_upper_video
+            return self.cpm_lower, self.cpm_upper
+        elif self.high_volume:
+            if video_mode:
+                return self.highvol_lower_video, self.highvol_upper_video
+            return self.highvol_lower, self.highvol_upper
+        elif self.mid_volume:
+            if video_mode:
+                return self.midvol_lower_video, self.midvol_upper_video
+            return self.midvol_lower, self.midvol_upper
+        else:
+            if video_mode:
+                return self.blue_lower_video, self.blue_upper_video
+            return self.blue_lower, self.blue_upper
 
-        # Edge detection
-        edges = cv2.Canny(blurred, 30, 100)
+    # ── MORPH OPEN KERNEL SIZE HELPER ─────────────────────────
+    def _get_morph_kernel_size(self):
+        """Pick the morph_open kernel size for the current mode (cpm > high > mid > normal).
+        Return 0 to skip the morph step entirely (preserves single-pixel particles)."""
+        if self.cpm_mode:
+            return self.morph_open_kernel_cpm
+        if self.high_volume:
+            return self.morph_open_kernel_high
+        if self.mid_volume:
+            return self.morph_open_kernel_mid
+        return self.morph_open_kernel_normal
 
-        # Dilate to close small gaps in the vessel edge
-        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-
-        # Find all contours
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
-        best = None
-        best_score = -1
-
-        for cnt in contours:
-            # Fit minimum enclosing circle
-            (cx, cy), r = cv2.minEnclosingCircle(cnt)
-            cx, cy, r = int(cx), int(cy), int(r)
-
-            # Filter: radius must be 20-55% of frame min dimension
-            if r < min_dim * 0.20 or r > min_dim * 0.55:
-                continue
-
-            # Filter: circle must be mostly within frame
-            if cx - r < -r * 0.15 or cy - r < -r * 0.15:
-                continue
-            if cx + r > w + r * 0.15 or cy + r > h + r * 0.15:
-                continue
-
-            # Score: prefer large, circular contours
-            area = cv2.contourArea(cnt)
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
-                continue
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-
-            # Score combines size (want largest) and circularity (want roundest)
-            score = r * circularity
-            if score > best_score:
-                best_score = score
-                best = (cx, cy, r)
-
-        return best
-
-    # ── MANUAL CIRCLE DRAWING (fallback when auto-detect fails) ──
+    # ── MANUAL CIRCLE DRAWING ────────────────────────────────
     def _manual_circle(self, frame):
         """Let user draw a circle by clicking center then dragging to set radius.
         Returns (center_x, center_y, radius) or None if cancelled."""
@@ -245,14 +235,14 @@ class ParticleAnalyzer:
             hub_radius = int(self.radius * 0.42)                  # ◄ Hub size (% of vessel radius)
             cv2.circle(obstruction, cpm_center, hub_radius, 255, -1)
             # Diagonal bar
-            bar_thickness = int(self.radius * 0.15)               # ◄ Bar width (% of radius)
+            """bar_thickness = int(self.radius * 0.15)               # ◄ Bar width (% of radius)
             angle_rad = np.radians(20)                            # ◄ Bar angle (degrees)
             bar_length = int(self.radius * 2.5)                   # ◄ Bar length (% of radius)
             dx = int(bar_length * np.cos(angle_rad))
             dy = int(bar_length * np.sin(angle_rad))
             pt1 = (cpm_center[0] - dx, cpm_center[1] - dy)
             pt2 = (cpm_center[0] + dx, cpm_center[1] + dy)
-            cv2.line(obstruction, pt1, pt2, 255, bar_thickness * 2)
+            cv2.line(obstruction, pt1, pt2, 255, bar_thickness * 2)"""
             # Cut obstruction out of vessel mask
             self.mask = cv2.bitwise_and(self.mask, cv2.bitwise_not(obstruction))
             print(f"  CPM mask applied: hub={hub_radius}px, bar=20deg, {np.sum(obstruction > 0):,}px excluded")
@@ -270,30 +260,14 @@ class ParticleAnalyzer:
         h, w = frame.shape[:2]
         if self._needs_mask_reinit(h, w):
             self._init_mask(h, w, frame=frame)
-        
+
         # Step 1: Apply vessel mask
         masked = cv2.bitwise_and(frame, frame, mask=self.mask)
         hsv = cv2.cvtColor(masked, cv2.COLOR_BGR2HSV)
-        
-        # Step 2: HSV color thresholding (picks CPM or normal range)
-        if video_mode:
-            if self.cpm_mode:
-                blue_mask = cv2.inRange(hsv, self.cpm_lower_video, self.cpm_upper_video)
-            elif self.high_volume:
-                blue_mask = cv2.inRange(hsv, self.highvol_lower_video, self.highvol_upper_video)
-            elif self.mid_volume:
-                blue_mask = cv2.inRange(hsv, self.midvol_lower_video, self.midvol_upper_video)
-            else:
-                blue_mask = cv2.inRange(hsv, self.blue_lower_video, self.blue_upper_video)
-        else:
-            if self.cpm_mode:
-                blue_mask = cv2.inRange(hsv, self.cpm_lower, self.cpm_upper)
-            elif self.high_volume:
-                blue_mask = cv2.inRange(hsv, self.highvol_lower, self.highvol_upper)
-            elif self.mid_volume:
-                blue_mask = cv2.inRange(hsv, self.midvol_lower, self.midvol_upper)
-            else:
-                blue_mask = cv2.inRange(hsv, self.blue_lower, self.blue_upper)
+
+        # Step 2: HSV color thresholding (picks range based on mode)
+        lower, upper = self._get_hsv_range(video_mode)
+        blue_mask = cv2.inRange(hsv, lower, upper)
         
         # Step 3: Background subtraction (removes static features in vessel)
         if self.background is not None or (video_mode and self.background_video is not None):
@@ -324,12 +298,14 @@ class ParticleAnalyzer:
 
         # Step 4: Re-mask to vessel boundary
         blue_mask = cv2.bitwise_and(blue_mask, self.mask)
-        
+
         # Step 5: Morphological opening for video (removes thin lines/ridges)
         if video_mode:
-            open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # ◄ Opening kernel size
-            blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, open_kernel)
-        
+            ksz = self._get_morph_kernel_size()
+            if ksz >= 2: # 0 = skip; 1 is a no-op anyway
+                open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+                blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, open_kernel)
+
         return blue_mask
     
     # ── DEBUG IMAGE SAVER (5-step pipeline visualization) ───────
@@ -341,18 +317,7 @@ class ParticleAnalyzer:
             self._init_mask(h, w, frame=frame)
         
         # Pick HSV range based on mode
-        if self.cpm_mode:
-            lower = self.cpm_lower_video if video_mode else self.cpm_lower
-            upper = self.cpm_upper_video if video_mode else self.cpm_upper
-        elif self.high_volume:
-            lower = self.highvol_lower_video if video_mode else self.highvol_lower
-            upper = self.highvol_upper_video if video_mode else self.highvol_upper
-        elif self.mid_volume:
-            lower = self.midvol_lower_video if video_mode else self.midvol_lower
-            upper = self.midvol_upper_video if video_mode else self.midvol_upper
-        else:
-            lower = self.blue_lower_video if video_mode else self.blue_lower
-            upper = self.blue_upper_video if video_mode else self.blue_upper
+        lower, upper = self._get_hsv_range(video_mode)
         
         # Debug step 1: Masked frame
         masked = cv2.bitwise_and(frame, frame, mask=self.mask)
@@ -409,8 +374,10 @@ class ParticleAnalyzer:
         
         # Morphological opening for video
         if video_mode:
-            open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            final = cv2.morphologyEx(final, cv2.MORPH_OPEN, open_kernel)
+            ksz = self._get_morph_kernel_size()
+            if ksz >= 2:
+                open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+                final = cv2.morphologyEx(final, cv2.MORPH_OPEN, open_kernel)
         
         # Debug step 5: Final detection result
         final_vis = frame.copy()
@@ -770,7 +737,7 @@ class ParticleAnalyzer:
         overlay[blue_mask > 0] = [0, 255, 0]  # Green = detected particles
         result = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
         cv2.circle(result, self.center, self.radius, (0, 255, 255), 2)  # Yellow vessel outline
-        
+
         spread = self.calc_spread(frame, video_mode=video_mode)
         text = f"Spread: {spread['spread']:.0%}"
         cv2.putText(result, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
@@ -820,7 +787,7 @@ def main():
     SAVE_IMAGES = False  # Save photo overlays + comparison chart
     SAVE_VIDEO = True    # Save video frame detection overlays
     TEST_SINGLE = False  # Only process one image (for debugging)
-    TEST_NAME = ""  # Filename stem (empty = first)
+    TEST_NAME = ""  # Filename stem (empty = first) #compression-1000mL-25.0-0.0-0.0-0.0deg-0.0deg-6.0mm-20.0mm-0.5_r1
     TEST_CPM = False  # Only process CPM files
     # ==================================================
     
@@ -828,6 +795,23 @@ def main():
     parser.add_argument('--input', '-i', default='Mixing time', help='Input folder')
     parser.add_argument('--output', '-o', default='./output', help='Output folder')
     parser.add_argument('--cpm', action='store_true', help='Only process CPM files')
+    # Optional HSV overrides — one set per volume tier (matches gui.py's tuner panel).
+    # Each tier is independent: passing one set doesn't affect the others. Format is "H,S,V" with
+    # integers 0-179 (Hue, OpenCV scale) / 0-255 (Sat, Val).
+    parser.add_argument('--hsv-lower',      dest='hsv_lower_normal', default=None, help='HSV lower for normal mode (50/60mL), "H,S,V" (e.g. 95,35,35)')
+    parser.add_argument('--hsv-upper',      dest='hsv_upper_normal', default=None, help='HSV upper for normal mode')
+    parser.add_argument('--hsv-lower-mid',  dest='hsv_lower_mid',    default=None, help='HSV lower for mid_volume mode (100mL)')
+    parser.add_argument('--hsv-upper-mid',  dest='hsv_upper_mid',    default=None, help='HSV upper for mid_volume mode')
+    parser.add_argument('--hsv-lower-high', dest='hsv_lower_high',   default=None, help='HSV lower for high_volume mode (200mL+)')
+    parser.add_argument('--hsv-upper-high', dest='hsv_upper_high',   default=None, help='HSV upper for high_volume mode')
+    parser.add_argument('--hsv-lower-cpm',  dest='hsv_lower_cpm',    default=None, help='HSV lower for CPM mode (compression)')
+    parser.add_argument('--hsv-upper-cpm',  dest='hsv_upper_cpm',    default=None, help='HSV upper for CPM mode')
+    # Per-tier MORPH_OPEN kernel size override. 0 = skip morphology entirely (preserves single-pixel particles).
+    # Default in code is 3 across all tiers.
+    parser.add_argument('--morph-kernel',      dest='morph_kernel_normal', type=int, default=None, help='MORPH_OPEN kernel size for normal mode (50/60mL). 0 = skip.')
+    parser.add_argument('--morph-kernel-mid',  dest='morph_kernel_mid',    type=int, default=None, help='MORPH_OPEN kernel size for mid_volume mode (100mL). 0 = skip.')
+    parser.add_argument('--morph-kernel-high', dest='morph_kernel_high',   type=int, default=None, help='MORPH_OPEN kernel size for high_volume mode (200mL+). 0 = skip.')
+    parser.add_argument('--morph-kernel-cpm',  dest='morph_kernel_cpm',    type=int, default=None, help='MORPH_OPEN kernel size for CPM mode. 0 = skip.')
     args = parser.parse_args()
     
     input_dir = Path(args.input)
@@ -872,6 +856,57 @@ def main():
             break
     
     analyzer = ParticleAnalyzer(bg_path, susp_path, bg_video_path)
+
+    # ── HSV THRESHOLD OVERRIDES (from GUI tuner, one per volume tier) ─────────────
+    # Each tier (normal / mid / high / cpm) is independent. If a tier's args weren't provided,
+    # that tier keeps its built-in default. Within a tier, the override applies to BOTH photo
+    # and video variants of that mode's HSV range.
+    def _parse_hsv(s):
+        return np.array([int(v) for v in s.split(',')]) if s else None
+
+    # tier -> (lower-arg, upper-arg, [lower-attr-names], [upper-attr-names])
+    tier_overrides = {
+        "normal": (args.hsv_lower_normal, args.hsv_upper_normal,
+                   ["blue_lower", "blue_lower_video"],     ["blue_upper", "blue_upper_video"]),
+        "mid":    (args.hsv_lower_mid,    args.hsv_upper_mid,
+                   ["midvol_lower", "midvol_lower_video"], ["midvol_upper", "midvol_upper_video"]),
+        "high":   (args.hsv_lower_high,   args.hsv_upper_high,
+                   ["highvol_lower", "highvol_lower_video"], ["highvol_upper", "highvol_upper_video"]),
+        "cpm":    (args.hsv_lower_cpm,    args.hsv_upper_cpm,
+                   ["cpm_lower", "cpm_lower_video"],       ["cpm_upper", "cpm_upper_video"]),
+    }
+    for tier, (lo_str, hi_str, lo_attrs, hi_attrs) in tier_overrides.items():
+        try:
+            lo = _parse_hsv(lo_str)
+            hi = _parse_hsv(hi_str)
+            if lo is not None:
+                for attr in lo_attrs:
+                    setattr(analyzer, attr, lo)
+                print(f"[HSV override] {tier:<7} lower = {lo.tolist()}")
+            if hi is not None:
+                for attr in hi_attrs:
+                    setattr(analyzer, attr, hi)
+                print(f"[HSV override] {tier:<7} upper = {hi.tolist()}")
+        except Exception as exc:
+            print(f"WARNING: failed to apply {tier} HSV override ({exc}). Tier will use defaults.")
+
+    # ── MORPH-OPEN KERNEL OVERRIDES (from GUI tuner) ────────────────
+    morph_overrides = {
+        "normal": (args.morph_kernel_normal, "morph_open_kernel_normal"),
+        "mid":    (args.morph_kernel_mid,    "morph_open_kernel_mid"),
+        "high":   (args.morph_kernel_high,   "morph_open_kernel_high"),
+        "cpm":    (args.morph_kernel_cpm,    "morph_open_kernel_cpm"),
+    }
+    for tier, (val, attr) in morph_overrides.items():
+        if val is not None:
+            try:
+                setattr(analyzer, attr, max(0, int(val)))
+                if int(val) < 2:
+                    print(f"[Morph override] {tier:<7} kernel = {val}  (morphology DISABLED — preserves single-pixel particles)")
+                else:
+                    print(f"[Morph override] {tier:<7} kernel = {val}")
+            except Exception as exc:
+                print(f"WARNING: failed to apply {tier} morph override ({exc}). Tier will use default.")
     
     # Load CPM background video separately (swapped in when processing CPM files)
     bg_video_cpm = None
@@ -909,7 +944,7 @@ def main():
     
     # Filter: CPM only
     if TEST_CPM:
-        images = [p for p in images if 'cpm' in p.stem.lower()]
+        images = [p for p in images if 'cpm' in p.stem.lower() or 'compression' in p.stem.lower()]
         print(f"CPM mode: filtering to CPM files only")
     
     # Filter: single test
@@ -923,7 +958,7 @@ def main():
     videos.update({p.stem: p for p in input_dir.glob('*.MP4') if not any(e in p.stem.lower() for e in exclude)})
     
     if TEST_CPM:  # Filter videos too
-        videos = {k: v for k, v in videos.items() if 'cpm' in k.lower()}
+        videos = {k: v for k, v in videos.items() if 'cpm' in k.lower() or 'compression' in k.lower()}
     
     print(f"Found {len(images)} images, {len(videos)} videos\n")
     
@@ -938,7 +973,7 @@ def main():
         print("-" * 40)
         
         # ── CPM MODE TOGGLE (auto based on filename) ───────────
-        is_cpm = 'cpm' in name.lower()
+        is_cpm = 'cpm' in name.lower() or 'compression' in name.lower()
         if is_cpm != analyzer.cpm_mode:
             analyzer.cpm_mode = is_cpm
             analyzer.mask = None  # Force mask reinit
@@ -1029,9 +1064,9 @@ def main():
             if is_cpm:
                 # CPM: detection only catches concentrated particles
                 # so lower thresholds — high detection = concentrated
-                if end_pct < 0.05:       # ◄ CPM: < 5% = suspended (barely visible)
+                if end_pct < 0.07:       # ◄ CPM: < 7% = suspended (barely visible)
                     result['status'] = 'MOSTLY_SUSPENDED'
-                elif end_pct < 0.135:  # ◄ CPM: 5-13.5% = intermediate
+                elif end_pct < 0.135:  # ◄ CPM: 7-13.5% = intermediate
                     result['status'] = 'INTERMEDIATE'
                 else:                     # ◄ CPM: > 13.5% = concentrating
                     result['status'] = 'CONCENTRATING'
@@ -1125,9 +1160,110 @@ def main():
             del _save_video_frames
 
         results.append(result)
-    
+
+    # ── VIDEO-ONLY PROCESSING (videos with no matching photo) ──
+    processed_names = {r['name'] for r in results}
+    video_only = {k: v for k, v in videos.items() if k not in processed_names}
+    if video_only:
+        print(f"\n{'='*40}")
+        print(f"Processing {len(video_only)} video-only files (no matching photo)")
+        print('='*40)
+
+    for name, vid_path in sorted(video_only.items()):
+        print(f"\n{name} (video only)")
+        print("-" * 40)
+
+        # ── MODE TOGGLES ──────────────────────────────────────
+        is_cpm = 'cpm' in name.lower() or 'compression' in name.lower()
+        if is_cpm != analyzer.cpm_mode:
+            analyzer.cpm_mode = is_cpm
+            analyzer.mask = None
+            if is_cpm:
+                if bg_video_cpm is not None:
+                    analyzer.background_video = bg_video_cpm
+                print(f"  CPM mode enabled")
+            else:
+                analyzer.background_video = analyzer._bg_video_normal
+
+        vol_match = re.search(r'(\d+)\s*m[lL]', name)
+        if vol_match:
+            vol_num = int(vol_match.group(1))
+            analyzer.high_volume = vol_num >= 200
+            analyzer.mid_volume = 100 <= vol_num < 200
+            new_vol = vol_match.group(1)
+            if getattr(analyzer, '_current_volume', None) != new_vol:
+                analyzer.mask = None
+            analyzer._current_volume = new_vol
+            if volume_backgrounds and not is_cpm and new_vol in volume_backgrounds:
+                analyzer.background_video = volume_backgrounds[new_vol]
+        else:
+            analyzer.high_volume = False
+            analyzer.mid_volume = False
+            analyzer._current_volume = 'unknown'
+
+        # ── ANALYZE VIDEO ─────────────────────────────────────
+        vid_result = analyzer.analyze_video(vid_path)
+        if not vid_result:
+            print(f"  Video: could not read")
+            continue
+
+        end_pct = vid_result['end_pct']
+        last_video_frame = vid_result.get('last_frame')
+
+        result = {
+            'name': name,
+            'video_end_pct': end_pct,
+        }
+        print(f"  Video end: {end_pct:.1%} of mask")
+
+        # ── CLASSIFICATION ────────────────────────────────────
+        if is_cpm:
+            if end_pct < 0.07:
+                result['status'] = 'MOSTLY_SUSPENDED'
+            elif end_pct < 0.135:
+                result['status'] = 'INTERMEDIATE'
+            else:
+                result['status'] = 'CONCENTRATING'
+        elif analyzer.high_volume:
+            if end_pct < 0.35:
+                result['status'] = 'CONCENTRATING'
+            elif end_pct < 0.55:
+                result['status'] = 'INTERMEDIATE'
+            else:
+                result['status'] = 'MOSTLY_SUSPENDED'
+        elif analyzer.mid_volume:
+            if end_pct < 0.35:
+                result['status'] = 'CONCENTRATING'
+            elif end_pct < 0.46:
+                result['status'] = 'INTERMEDIATE'
+            else:
+                result['status'] = 'MOSTLY_SUSPENDED'
+        else:
+            if end_pct < 0.40:
+                result['status'] = 'CONCENTRATING'
+            elif end_pct < 0.80:
+                result['status'] = 'INTERMEDIATE'
+            else:
+                result['status'] = 'MOSTLY_SUSPENDED'
+        print(f"  Status: {result['status']}")
+
+        # ── SAVE VIDEO OVERLAYS ───────────────────────────────
+        if SAVE_VIDEO and last_video_frame is not None:
+            show_blobs = not analyzer.cpm_mode and (result.get('status') != 'MOSTLY_SUSPENDED' or TEST_SINGLE)
+            cv2.imwrite(str(output_dir / f"{name}_video_raw.png"), last_video_frame)
+            analyzer.save_overlay(last_video_frame, output_dir / f"{name}_video_detection.png", draw_blobs=show_blobs, video_mode=True)
+            # First frame
+            cap = cv2.VideoCapture(str(vid_path))
+            ret, first_frame = cap.read()
+            cap.release()
+            if ret:
+                analyzer.save_overlay(first_frame, output_dir / f"{name}_first_frame.png", draw_blobs=False, video_mode=True)
+            print(f"  Saved video overlays")
+
+        results.append(result)
+
     if not results:
-        print("No images analyzed!")
+        print("No experiments analyzed!")
         return
     
     # ── SAVE RESULTS JSON ──────────────────────────────────────
