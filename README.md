@@ -9,20 +9,14 @@ of interest (ROI) covered by detected particles in the last frame of each video.
 
 ---
 
-## What's in the folder
+## What's in the repository
 
 | File                          | Purpose                                                               |
 | ----------------------------- | --------------------------------------------------------------------- |
 | `gui.py`                      | Tkinter front-end. Folder pickers, per-volume HSV tuner, Run button.  |
 | `particle_testing.py`         | The actual analyzer. Detection, ROI prompting, charts, JSON writeout. |
-| `streamlit_gui.py`            | Earlier Streamlit version of the front-end. Kept for reference.       |
-| `moretest.py` / `test ai.py`  | Tuning experiments — channel-ratio filter and a kNN HSV sampler.      |
-| `_filter_diagnostic.py`       | Scratch script comparing mask-cleanup strategies on a real frame.     |
-| `outputredo.py`, `frame.py`   | One-off helpers.                                                      |
-| `powerlifting_ml/`            | Unrelated side project.                                               |
 
-The two files that matter day-to-day are **`gui.py`** and
-**`particle_testing.py`**. They must live in the same folder — `gui.py`
+ **`gui.py`** and **`particle_testing.py`** must live in the same folder — `gui.py`
 shells out to `particle_testing.py` by relative path.
 
 ---
@@ -38,16 +32,6 @@ pandas
 matplotlib
 pillow
 ```
-
-The `ORI` conda env on this machine already has them. Run with:
-
-```
-C:\Users\JackHu\anaconda3\envs\ORI\python.exe gui.py
-```
-
-If `cv2` / `numpy` ImportError → wrong interpreter.
-
----
 
 ## Input folder layout
 
