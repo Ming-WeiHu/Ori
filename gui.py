@@ -578,7 +578,7 @@ class AnalyzerGUI:
         self.cpm_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frm_opts,
-            text="CPM-only mode  (skip non-compression files; usually leave unchecked — analyzer auto-detects per filename)",
+            text="CPM-only mode  (skip non-compression files)",
             variable=self.cpm_var,
         ).pack(side="left")
 
